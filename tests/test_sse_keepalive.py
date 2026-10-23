@@ -4,6 +4,7 @@
 import asyncio
 import json
 import socket
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -178,6 +179,89 @@ async def test_cancelled_response_scope_lets_upstream_cleanup_finish(wrapper):
         task_group.cancel_scope.cancel()
 
     assert cleaned.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leased", [False, True])
+async def test_json_keepalive_close_after_first_chunk_cancels_inference(leased):
+    cleaned = asyncio.Event()
+    released = []
+
+    class Lease:
+        def abort_reason(self):
+            return None
+
+        async def release(self):
+            released.append(cleaned.is_set())
+
+    async def inference():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    task = asyncio.create_task(inference())
+    await asyncio.sleep(0)
+    body = _with_json_keepalive(None, task)
+    if leased:
+        body = server._release_after_stream(body, Lease())
+    try:
+        assert await anext(body) == " "
+        await body.aclose()
+        assert task.done()
+        assert cleaned.is_set()
+        assert released == ([True] if leased else [])
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_leased_stream_closes_child_before_releasing(cancelled):
+    events = []
+
+    class Lease:
+        def abort_reason(self):
+            return None
+
+        async def release(self):
+            events.append("released")
+
+    async def stream():
+        try:
+            yield "data: token\n\n"
+        finally:
+            await asyncio.sleep(0)
+            events.append("closed")
+
+    child = stream()
+    body = server._release_after_stream(child, Lease())
+    assert await anext(body) == "data: token\n\n"
+    try:
+        with anyio.CancelScope() as scope:
+            if cancelled:
+                scope.cancel()
+            await body.aclose()
+        assert events == ["closed", "released"]
+    finally:
+        await child.aclose()
+
+
+@pytest.mark.asyncio
+async def test_leased_stream_normal_completion_releases_once():
+    lease = Mock()
+    lease.abort_reason.return_value = None
+    lease.release = AsyncMock()
+
+    async def stream():
+        yield "data: token\n\n"
+
+    assert await _collect(server._release_after_stream(stream(), lease)) == [
+        "data: token\n\n"
+    ]
+    lease.release.assert_awaited_once()
 
 
 @pytest.mark.asyncio

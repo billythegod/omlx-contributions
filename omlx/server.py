@@ -1700,7 +1700,15 @@ async def _release_after_stream(
         async for chunk in generator:
             yield chunk
     finally:
-        await lease.release()
+        # A transport can close us while suspended at yield, without closing
+        # the child iterator. Drain it before releasing the engine lease.
+        try:
+            with anyio.CancelScope(shield=True):
+                await _aclose_async_iterator(generator)
+        finally:
+            # The pool tracks its own release task; cancellation must still
+            # unwind the response while that task waits for the pool lock.
+            await lease.release()
 
 
 async def get_engine_for_model(
@@ -3107,9 +3115,8 @@ async def _with_json_keepalive(
     task = asyncio.ensure_future(coro_or_task)
     keepalive_elapsed = 0.0
 
-    yield " "
-
     try:
+        yield " "
         while not task.done():
             done, _ = await asyncio.wait({task}, timeout=disconnect_poll)
             if done:
