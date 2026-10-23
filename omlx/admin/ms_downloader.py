@@ -6,6 +6,7 @@ with directory-size-based progress polling.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import shutil
@@ -780,8 +781,8 @@ class MSDownloader(_QueuePersistenceMixin):
         if progress_task and not progress_task.done():
             progress_task.cancel()
 
-        # Cancel the download task
-        active_task = self._active_tasks.pop(task_id, None)
+        # Retain ownership until the blocking writer has finished.
+        active_task = self._active_tasks.get(task_id)
         if active_task and not active_task.done():
             active_task.cancel()
 
@@ -930,12 +931,25 @@ class MSDownloader(_QueuePersistenceMixin):
                 if ms_token:
                     dl_kwargs["token"] = ms_token
 
-                # Run snapshot_download in a thread (blocking call)
-                # Note: Thread cannot be interrupted, cancellation is checked after completion
-                await asyncio.to_thread(
-                    ms_snapshot_download,
-                    **dl_kwargs,
+                payload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(ms_snapshot_download, **dl_kwargs),
                 )
+                try:
+                    await asyncio.shield(payload)
+                except asyncio.CancelledError:
+                    # The SDK thread cannot be interrupted. Hold the queue slot
+                    # until it stops writing, even if shutdown cancels us again.
+                    while not payload.done():
+                        try:
+                            await asyncio.shield(payload)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not payload.cancelled():
+                        payload.exception()
+                    raise
 
                 # Check if cancelled while downloading - clean up downloaded files
                 if task_id in self._cancelled:

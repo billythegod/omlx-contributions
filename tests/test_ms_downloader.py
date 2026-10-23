@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -318,6 +319,76 @@ class TestMSDownloader:
     async def test_cancel_nonexistent_task(self, downloader):
         result = await downloader.cancel_download("nonexistent")
         assert result is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail_first", [False, True])
+    async def test_cancelled_writer_finishes_before_retry(self, downloader, fail_first):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        retry_started = threading.Event()
+        calls = []
+        workers = []
+
+        def download(**kwargs):
+            calls.append(kwargs["local_dir"])
+            target = Path(kwargs["local_dir"])
+            target.mkdir(parents=True, exist_ok=True)
+            payload = target / "payload.bin"
+            if len(calls) == 1:
+                started.set()
+                try:
+                    assert release.wait(5)
+                    payload.write_bytes(b"first attempt")
+                    if fail_first:
+                        raise RuntimeError("First transfer failed after cancellation")
+                finally:
+                    finished.set()
+            else:
+                retry_started.set()
+                payload.write_bytes(b"completed retry")
+
+        with (
+            patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True),
+            patch("omlx.admin.ms_downloader._get_ms_api", return_value=None),
+            patch(
+                "omlx.admin.ms_downloader.ms_snapshot_download", side_effect=download
+            ),
+        ):
+            try:
+                first = await downloader.start_download("owner/model")
+                first_worker = downloader._active_tasks[first.task_id]
+                workers.append(first_worker)
+                await _wait_for(started.is_set)
+                assert await downloader.cancel_download(first.task_id)
+                assert first.status == DownloadStatus.CANCELLED
+                retry = await downloader.retry_download(first.task_id)
+                retry_worker = downloader._active_tasks[retry.task_id]
+                workers.append(retry_worker)
+                await asyncio.sleep(0)
+                first_worker.cancel()
+                await asyncio.sleep(0)
+                assert not first_worker.done()
+                assert downloader._active_tasks[first.task_id] is first_worker
+                assert retry.status == DownloadStatus.PENDING
+                assert not retry_started.is_set()
+
+                release.set()
+                await asyncio.gather(*workers)
+                assert finished.is_set()
+                assert retry_started.is_set()
+                assert first.status == DownloadStatus.CANCELLED
+                assert retry.status == DownloadStatus.COMPLETED
+                assert calls[0] == calls[1]
+                assert (
+                    Path(calls[1]) / "payload.bin"
+                ).read_bytes() == b"completed retry"
+            finally:
+                release.set()
+                await asyncio.gather(*workers, return_exceptions=True)
+                if started.is_set():
+                    await _wait_for(finished.is_set)
+                await downloader.shutdown()
 
     @pytest.mark.asyncio
     async def test_cancel_completed_task(self, downloader):
