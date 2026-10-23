@@ -7,6 +7,7 @@ processing, following the same pattern as hf_downloader.py.
 
 import asyncio
 import enum
+import functools
 import json
 import logging
 import math
@@ -15,10 +16,10 @@ import struct
 import tempfile
 import time
 import uuid
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Optional
 
 from ..model_discovery import CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS
 from ..oq import (
@@ -683,10 +684,38 @@ class HFUploader:
         from huggingface_hub import HfApi
 
         task = self._tasks[task_id]
-        tmp_readme: Optional[Path] = None
+        tmp_readme: Path | None = None
+        readme_backup_dir: Path | None = None
+        readme_backup: Path | None = None
+
+        def restore_readme() -> None:
+            if tmp_readme is not None:
+                try:
+                    if readme_backup is not None:
+                        # Stage the restore only after upload_folder has stopped.
+                        # Replacing also handles read-only cards and symlinks.
+                        with tempfile.TemporaryDirectory(
+                            prefix=".omlx-readme-restore-", dir=tmp_readme.parent
+                        ) as directory:
+                            restored = Path(directory) / "README.md"
+                            shutil.copy2(readme_backup, restored, follow_symlinks=False)
+                            restored.replace(tmp_readme)
+                    else:
+                        tmp_readme.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception(
+                        "Could not restore upload README %s; backup retained at %s",
+                        tmp_readme,
+                        readme_backup,
+                    )
+                    return
+            if readme_backup_dir is not None:
+                shutil.rmtree(readme_backup_dir)
 
         try:
-            async with self._upload_sem:
+            async with AsyncExitStack() as cleanup:
+                await cleanup.enter_async_context(self._upload_sem)
+                cleanup.callback(restore_readme)
                 if task_id in self._cancelled:
                     return
 
@@ -710,11 +739,14 @@ class HFUploader:
 
                 # Handle README
                 readme_in_model = model_path / "README.md"
+                source_readme: Path | None = None
+                readme_content: str | None = None
                 if readme_source_path:
-                    source_readme = Path(readme_source_path) / "README.md"
-                    if source_readme.exists():
-                        shutil.copy2(source_readme, readme_in_model)
-                        tmp_readme = readme_in_model
+                    candidate = Path(readme_source_path) / "README.md"
+                    if candidate.exists() and not (
+                        readme_in_model.exists() and candidate.samefile(readme_in_model)
+                    ):
+                        source_readme = candidate
                 elif auto_readme and not _has_meaningful_readme(model_path):
                     try:
                         with open(model_path / "config.json") as f:
@@ -727,8 +759,22 @@ class HFUploader:
                         config,
                         redownload_notice=redownload_notice,
                     )
-                    readme_in_model.write_text(readme_content, encoding="utf-8")
+
+                if source_readme is not None or readme_content is not None:
+                    if readme_in_model.exists() or readme_in_model.is_symlink():
+                        readme_backup_dir = Path(
+                            tempfile.mkdtemp(prefix="omlx-upload-readme-")
+                        )
+                        backup = readme_backup_dir / "README.md"
+                        shutil.copy2(readme_in_model, backup, follow_symlinks=False)
+                        readme_backup = backup
+                    # Record ownership before writing so a partial write is restored.
                     tmp_readme = readme_in_model
+                    tmp_readme.unlink(missing_ok=True)
+                    if source_readme is not None:
+                        shutil.copy2(source_readme, readme_in_model)
+                    else:
+                        readme_in_model.write_text(readme_content, encoding="utf-8")
 
                 if task_id in self._cancelled:
                     return
@@ -737,13 +783,31 @@ class HFUploader:
                 # upload_folder is blocking; run in thread
                 task.progress = 10.0  # Signal that upload has started
 
-                await asyncio.to_thread(
-                    api.upload_folder,
-                    folder_path=str(model_path),
-                    repo_id=task.repo_id,
-                    token=token,
-                    commit_message=f"Upload {task.model_name} via oMLX",
+                upload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
+                        api.upload_folder,
+                        folder_path=str(model_path),
+                        repo_id=task.repo_id,
+                        token=token,
+                        commit_message=f"Upload {task.model_name} via oMLX",
+                    ),
                 )
+                try:
+                    await asyncio.shield(upload)
+                except asyncio.CancelledError:
+                    # Cancelling to_thread cannot stop its reader. Keep the README
+                    # and queue slot until it finishes, including during shutdown.
+                    while not upload.done():
+                        try:
+                            await asyncio.shield(upload)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    if not upload.cancelled():
+                        upload.exception()
+                    raise
 
                 if task_id in self._cancelled:
                     return
@@ -769,10 +833,4 @@ class HFUploader:
                 task.error = str(e)
                 logger.error(f"Upload failed for {task.model_name}: {e}")
         finally:
-            # Clean up copied/generated README if we created it
-            if tmp_readme and tmp_readme.exists():
-                try:
-                    tmp_readme.unlink()
-                except Exception:
-                    pass
             self._active_tasks.pop(task_id, None)
