@@ -301,7 +301,9 @@ class TestSTSModelAliasResolution:
                     files={"file": ("test.wav", TINY_WAV, "audio/wav")},
                 )
                 assert response.status_code == 200
-                mock_pool.get_engine.assert_awaited_once_with("MossFormer2-SE", _lease=True)
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "MossFormer2-SE", _lease=True
+                )
 
     def test_process_direct_model_id(self):
         """POST /v1/audio/process with direct model ID works without alias."""
@@ -332,7 +334,9 @@ class TestSTSModelAliasResolution:
                     files={"file": ("test.wav", TINY_WAV, "audio/wav")},
                 )
                 assert response.status_code == 200
-                mock_pool.get_engine.assert_awaited_once_with("MossFormer2-SE", _lease=True)
+                mock_pool.get_engine.assert_awaited_once_with(
+                    "MossFormer2-SE", _lease=True
+                )
 
 
 # ---------------------------------------------------------------------------
